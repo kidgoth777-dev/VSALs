@@ -1,5 +1,3 @@
-import urllib.parse
-
 import discord
 from discord import app_commands
 from config import (
@@ -14,45 +12,6 @@ def is_staff(member: discord.Member):
     return any(role.id in STAFF_ROLE_IDS for role in member.roles)
 
 
-async def get_all_reactor_ids(bot, channel_id: int, message_id: int, emoji) -> set:
-    """Returns the set of user IDs who reacted with this emoji, covering
-    BOTH normal reactions and Discord's 'super reactions' (burst type).
-    A plain reaction.users() call can silently miss burst reactors, which
-    is why this hits the API directly for both types."""
-    ids = set()
-    quoted_emoji = urllib.parse.quote(str(emoji), safe="")
-
-    for reaction_type in (0, 1):  # 0 = normal, 1 = burst/super reaction
-        after = None
-        while True:
-            try:
-                data = await bot.http.get_reaction_users(
-                    channel_id, message_id, quoted_emoji, 100,
-                    after=after, type=reaction_type,
-                )
-            except TypeError:
-                # Older discord.py without burst-type support — fall back
-                # to a single untyped call (normal reactions only).
-                data = await bot.http.get_reaction_users(
-                    channel_id, message_id, quoted_emoji, 100, after=after,
-                )
-                for u in data:
-                    ids.add(int(u["id"]))
-                break
-            except discord.HTTPException:
-                break
-
-            if not data:
-                break
-            for u in data:
-                ids.add(int(u["id"]))
-            if len(data) < 100:
-                break
-            after = data[-1]["id"]
-
-    return ids
-
-
 def setup_commands(bot):
     """Registers all slash commands that live in this file onto the bot."""
 
@@ -63,11 +22,13 @@ def setup_commands(bot):
     @app_commands.describe(
         user="The member to check.",
         checks="How many recent checks to look at (default 1).",
+        debug="Show which messages/reactions were checked (for troubleshooting).",
     )
     async def checkact(
         interaction: discord.Interaction,
         user: discord.Member,
         checks: int = DEFAULT_CHECK_COUNT,
+        debug: bool = False,
     ):
         await interaction.response.defer()
 
@@ -95,13 +56,15 @@ def setup_commands(bot):
         channel = interaction.guild.get_channel(ACTIVITY_CHANNEL_ID)
         if channel is None:
             await interaction.followup.send(
-                "❌ Couldn't find the activity check channel.",
+                f"❌ Couldn't find channel ID `{ACTIVITY_CHANNEL_ID}` in this server. "
+                f"Double check ACTIVITY_CHANNEL_ID matches a channel that actually exists here.",
                 ephemeral=True,
             )
             return
 
         # Pull the most recent non-bot messages from the activity channel —
-        # each one counts as one "check". No pre-tracking needed.
+        # each one counts as one "check". No pre-tracking needed. Any
+        # reaction, with any emoji, counts as that person being "ticked in".
         messages = []
         async for msg in channel.history(limit=200):
             if msg.author.bot:
@@ -112,21 +75,36 @@ def setup_commands(bot):
 
         if not messages:
             await interaction.followup.send(
-                "There are no activity check messages in that channel yet.",
+                f"There are no non-bot messages in {channel.mention} yet.",
                 ephemeral=True,
             )
             return
 
         reacted_count = 0
+        debug_lines = []
+
         for msg in messages:
             found = False
+            msg_reaction_summary = []
+
             for reaction in msg.reactions:
-                reactor_ids = await get_all_reactor_ids(
-                    bot, msg.channel.id, msg.id, reaction.emoji
+                users_here = []
+                async for reactor in reaction.users():
+                    users_here.append(reactor)
+                    if reactor.id == user.id:
+                        found = True
+
+                msg_reaction_summary.append(
+                    f"{reaction.emoji} × {len(users_here)}"
+                    f" ({', '.join(u.name for u in users_here) or 'none'})"
                 )
-                if user.id in reactor_ids:
-                    found = True
-                    break
+
+            debug_lines.append(
+                f"[{msg.jump_url}] by {msg.author}: "
+                + ("; ".join(msg_reaction_summary) if msg_reaction_summary else "no reactions")
+                + (" ✅ MATCH" if found else "")
+            )
+
             if found:
                 reacted_count += 1
 
@@ -134,6 +112,15 @@ def setup_commands(bot):
         passed = (reacted_count / total) >= PASS_THRESHOLD
         emoji = "✅" if passed else "❌"
 
-        await interaction.followup.send(
+        result = (
             f"{emoji} {user.mention} has reacted to **{reacted_count}** of the last **{total}** checks."
         )
+
+        if debug:
+            debug_text = "\n".join(debug_lines)
+            result += f"\n\n**Debug info:**\n{debug_text}"
+
+        if len(result) > 1900:
+            result = result[:1900] + "\n… (truncated)"
+
+        await interaction.followup.send(result)
